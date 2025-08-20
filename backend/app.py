@@ -16,6 +16,13 @@ from pydantic import BaseModel
 from segment_anything import sam_model_registry, SamPredictor
 
 # -------------------------
+# Passwords
+# -------------------------
+PASSWORDS = ["pass1", "pass2", "pass3", "pass4"]  # rotate list
+current_index = 0
+
+
+# -------------------------
 # FastAPI app & CORS
 # -------------------------
 app = FastAPI(title="SAM Segmentation Service", version="1.0.0")
@@ -112,6 +119,17 @@ async def health():
             pass
     return info
 
+from fastapi import Request
+
+@app.post("/auth")
+async def auth(data: Dict[str, str]):
+    global current_index
+    password = data.get("password")
+    if password == PASSWORDS[current_index]:
+        # Rotate password (next one in list)
+        current_index = (current_index + 1) % len(PASSWORDS)
+        return {"ok": True}
+    raise HTTPException(status_code=401, detail="Invalid password")
 
 
 @app.post("/session/start")

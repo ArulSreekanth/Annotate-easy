@@ -18,6 +18,10 @@ module.exports = {
         test: /\.css$/,
         use: ['style-loader', 'css-loader', 'postcss-loader'],
       },
+      {
+        test: /\.(png|jpe?g|gif|svg)$/i,
+        type: "asset/resource",
+      },
     ],
   },
   plugins: [
@@ -26,8 +30,10 @@ module.exports = {
     }),
   ],
   devServer: {
-    port: 8081,
+    port: 8080,
     host: '0.0.0.0',
     historyApiFallback: true,
+    hot: false,
+    liveReload: false,
   },
 };

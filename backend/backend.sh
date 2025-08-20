@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Start ngrok in the background
-ngrok http 8085 > /dev/null &
+ngrok http 8000 > /dev/null &
 NGROK_PID=$!
 
 # Wait for ngrok to be ready
@@ -17,4 +17,4 @@ echo "Ngrok URL: $NGROK_URL"
 export NGROK_URL=$NGROK_URL
 
 # Run backend
-uvicorn app:app --host 0.0.0.0 --port 8085
+uvicorn app:app --host 0.0.0.0 --port 8000

@@ -2,15 +2,16 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Stage, Layer, Group, Image as KonvaImage, Circle, Line, Rect, Text } from "react-konva";
 import useImage from "use-image";
 import axios from "axios";
+import frontImage from "./assets/front_image.jpeg";
 
 // --------- CONFIG (no process.env here to avoid "process is not defined") ----------
-const API_BASE = "https://7ca86f5c2227.ngrok-free.app";
+const API_BASE = (window && window.API_BASE) || "http://localhost:8000";
 
 // --------- UTILS ----------
 function centroid(poly) {
   if (!poly?.length) return [0, 0];
   let sx = 0, sy = 0;
-  for (const [x, y] of poly) { sx += x; sy += y; }
+  for (const [x, y] of poly) { sx += x; sy += y; }  
   return [sx / poly.length, sy / poly.length];
 }
 
@@ -34,20 +35,27 @@ function download(filename, blob) {
 
 // --------- APP ----------
 export default function App() {
-  // Session & image
+
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [password, setPassword] = useState("");
+
+   const [images, setImages] = useState([]);
+  const [annotations, setAnnotations] = useState([]);
+  const canvasRef = useRef();
+
+  
+    // Session & image
   const [sessionId, setSessionId] = useState(null);
   const [imageFile, setImageFile] = useState(null);
   const [imageUrl, setImageUrl] = useState(null);
   const [imageObj] = useImage(imageUrl);
 
   // Modes
-  const [mode, setMode] = useState(null); // 'points' | 'box' | 'draw' | 'edit' | null
+  const [mode, setMode] = useState(null); // 'points' | 'edit' | null (removed 'box' and 'draw')
 
   // Annotation state (image coordinates)
   const [points, setPoints] = useState([]);            // [[x,y], ...]
-  const [box, setBox] = useState(null);                // {x1,y1,x2,y2}
   const [polygons, setPolygons] = useState([]);        // {id, points:[[x,y]], label, score?}
-  const [currentPolygonPoints, setCurrentPolygonPoints] = useState([]);
   const [selectedPolygonId, setSelectedPolygonId] = useState(null);
   const [dragIdx, setDragIdx] = useState(null);
 
@@ -65,9 +73,7 @@ export default function App() {
       ...st,
       {
         points: JSON.parse(JSON.stringify(points)),
-        box: box ? { ...box } : null,
         polygons: JSON.parse(JSON.stringify(polygons)),
-        currentPolygonPoints: JSON.parse(JSON.stringify(currentPolygonPoints)),
         selectedPolygonId,
         zoom,
         pan: { ...pan },
@@ -84,12 +90,36 @@ export default function App() {
 
   // Refs
   const stageRef = useRef(null);
+  const containerRef = useRef(null);
 
-  // Canvas dimensions (natural image size)
-  const canvasSize = useMemo(
-    () => ({ width: imageObj?.width || 1200, height: imageObj?.height || 800 }),
-    [imageObj]
-  );
+  // Dynamic stage size for responsiveness
+  const [stageSize, setStageSize] = useState({ width: window.innerWidth, height: window.innerHeight });
+
+  useEffect(() => {
+    const resize = () => {
+      if (containerRef.current) {
+        setStageSize({
+          width: containerRef.current.offsetWidth,
+          height: containerRef.current.offsetHeight,
+        });
+      }
+    };
+    window.addEventListener("resize", resize);
+    resize();
+    return () => window.removeEventListener("resize", resize);
+  }, []);
+
+  // Auto-fit image on load or stage resize
+  useEffect(() => {
+    if (imageObj) {
+      const scale = Math.min(stageSize.width / imageObj.width, stageSize.height / imageObj.height, 1); // max 1x
+      setZoom(scale);
+      setPan({
+        x: (stageSize.width - imageObj.width * scale) / 2,
+        y: (stageSize.height - imageObj.height * scale) / 2,
+      });
+    }
+  }, [imageObj, stageSize]);
 
   // ---------- Session / Upload ----------
   const handleImageUpload = async (e) => {
@@ -110,7 +140,7 @@ export default function App() {
       setMessage(`Session started (${data.image_size[0]}x${data.image_size[1]})`);
 
       // reset state
-      setPoints([]); setBox(null); setPolygons([]); setCurrentPolygonPoints([]);
+      setPoints([]); setPolygons([]); 
       setSelectedPolygonId(null); setZoom(1); setPan({ x: 0, y: 0 });
       setUndoStack([]); setRedoStack([]);
     } catch (err) {
@@ -128,13 +158,12 @@ export default function App() {
   // ---------- SAM call (single polygon, ask label) ----------
   const runSAM = async () => {
     if (!sessionId) return setMessage("Upload an image first");
-    if (!points.length && !box) return setMessage("Add points or box first");
+    if (!points.length) return setMessage("Add points first");
 
     const payload = {
       session_id: sessionId,
       points: points.length ? points : undefined,
       point_labels: points.length ? new Array(points.length).fill(1) : undefined,
-      box: box ? [box.x1, box.y1, box.x2, box.y2] : undefined,
       multimask: false, // <<< only 1 mask from backend
     };
 
@@ -148,7 +177,7 @@ export default function App() {
       }
 
       if (!best || !best.polygons?.length) {
-        setMessage("SAM returned no polygons. Try adding more clicks or a box.");
+        setMessage("SAM returned no polygons. Try adding more clicks.");
         return;
       }
 
@@ -168,7 +197,6 @@ export default function App() {
       saveState();
       setPolygons((prev) => [...prev, newPoly]);
       setPoints([]);
-      setBox(null);
       setMessage(`Added 1 polygon (score ${best.score.toFixed(3)})`);
     } catch (err) {
       setMessage(`Error: ${err?.response?.data?.detail || err.message}`);
@@ -205,13 +233,6 @@ export default function App() {
     if (mode === "points") {
       saveState();
       setPoints((prev) => [...prev, [ix, iy]]);
-    } else if (mode === "box") {
-      saveState();
-      if (!box) setBox({ x1: ix, y1: iy, x2: ix, y2: iy });
-      else setBox((b) => ({ ...b, x2: ix, y2: iy }));
-    } else if (mode === "draw") {
-      saveState();
-      setCurrentPolygonPoints((prev) => [...prev, [ix, iy]]);
     } else if (mode === "edit") {
       // select polygon
       const hit = polygons.find((p) => pointInPoly(ix, iy, p.points));
@@ -234,19 +255,6 @@ export default function App() {
   };
 
   const onStageMouseUp = () => setIsPanning(false);
-
-  const onDblClick = () => {
-    if (mode === "draw" && currentPolygonPoints.length >= 3) {
-      saveState();
-      const label = window.prompt("Enter label for this polygon:", "Manual");
-      setPolygons((prev) => [
-        ...prev,
-        { id: `manual_${Date.now()}`, points: currentPolygonPoints, label: label || "Manual" },
-      ]);
-      setCurrentPolygonPoints([]);
-      setMode(null);
-    }
-  };
 
   const onWheel = (e) => {
     e.evt.preventDefault();
@@ -307,12 +315,10 @@ export default function App() {
     const prev = undoStack[undoStack.length - 1];
     setRedoStack((st) => [
       ...st,
-      { points, box, polygons, currentPolygonPoints, selectedPolygonId, zoom, pan },
+      { points, polygons, selectedPolygonId, zoom, pan },
     ]);
     setPoints(prev.points);
-    setBox(prev.box);
     setPolygons(prev.polygons);
-    setCurrentPolygonPoints(prev.currentPolygonPoints);
     setSelectedPolygonId(prev.selectedPolygonId);
     setZoom(prev.zoom);
     setPan(prev.pan);
@@ -323,12 +329,10 @@ export default function App() {
     const next = redoStack[redoStack.length - 1];
     setUndoStack((st) => [
       ...st,
-      { points, box, polygons, currentPolygonPoints, selectedPolygonId, zoom, pan },
+      { points, polygons, selectedPolygonId, zoom, pan },
     ]);
     setPoints(next.points);
-    setBox(next.box);
     setPolygons(next.polygons);
-    setCurrentPolygonPoints(next.currentPolygonPoints);
     setSelectedPolygonId(next.selectedPolygonId);
     setZoom(next.zoom);
     setPan(next.pan);
@@ -336,7 +340,7 @@ export default function App() {
   };
   const clearAll = () => {
     saveState();
-    setPoints([]); setBox(null); setPolygons([]); setCurrentPolygonPoints([]); setSelectedPolygonId(null);
+    setPoints([]); setPolygons([]); setSelectedPolygonId(null);
   };
 
   // Export / Import
@@ -394,146 +398,202 @@ export default function App() {
     }
   };
 
+  // Example effect (runs always, no matter login state)
+  useEffect(() => {
+    console.log("App mounted");
+  }, []);
+
+  // 🔹 Login handler
+  const handleLogin = async () => {
+    try {
+      const res = await axios.post(`${API_BASE}/auth`, { password });
+      if (res.data.ok) {
+        setIsLoggedIn(true);
+      } else {
+        alert("Wrong password!");
+      }
+    } catch {
+      alert("Login error");
+    }
+  };
+
+  // 🔹 Logout
+  const handleLogout = () => {
+    setIsLoggedIn(false);
+    setPassword("");
+  };
   // ---------- RENDER ----------
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900">
-      <header className="px-6 py-4 border-b bg-white sticky top-0 z-10 flex items-center gap-3">
-        <h1 className="text-xl font-semibold">SAM Annotation Tool</h1>
-        <input type="file" accept="image/*" onChange={handleImageUpload} className="ml-4" />
-        <div className="flex-1" />
-        <div className="flex gap-2">
-          <button className={`px-3 py-1 rounded ${mode === "points" ? "bg-blue-600 text-white" : "bg-slate-200"}`} onClick={() => setMode(mode === "points" ? null : "points")}>Point</button>
-          <button className={`px-3 py-1 rounded ${mode === "box" ? "bg-blue-600 text-white" : "bg-slate-200"}`} onClick={() => setMode(mode === "box" ? null : "box")}>Box</button>
-          <button className={`px-3 py-1 rounded ${mode === "draw" ? "bg-blue-600 text-white" : "bg-slate-200"}`} onClick={() => setMode(mode === "draw" ? null : "draw")}>Draw</button>
-          <button className={`px-3 py-1 rounded ${mode === "edit" ? "bg-blue-600 text-white" : "bg-slate-200"}`} onClick={() => setMode(mode === "edit" ? null : "edit")}>Edit</button>
-          <button className="px-3 py-1 rounded bg-emerald-600 text-white" onClick={runSAM}>Run SAM</button>
-          <button className="px-3 py-1 rounded bg-slate-200" onClick={undo} disabled={!undoStack.length}>Undo</button>
-          <button className="px-3 py-1 rounded bg-slate-200" onClick={redo} disabled={!redoStack.length}>Redo</button>
-          <button className="px-3 py-1 rounded bg-slate-200" onClick={clearAll}>Clear</button>
-          <button className="px-3 py-1 rounded bg-slate-200" onClick={exportJSON} disabled={!polygons.length}>Save JSON</button>
-          <button className="px-3 py-1 rounded bg-slate-200" onClick={exportCOCO} disabled={!polygons.length}>Save COCO</button>
-          <label className="px-3 py-1 rounded bg-slate-200 cursor-pointer">
-            Load JSON
-            <input type="file" accept=".json" className="hidden" onChange={importJSON} />
+    <div className="min-h-screen bg-gray-100 text-gray-900 flex flex-col font-sans">
+      {!isLoggedIn ? (
+        // ------------------- LOGIN SCREEN -------------------
+        <div className="flex items-center justify-center h-screen bg-gray-100">
+          <div className="p-6 bg-white rounded-2xl shadow-md w-80">
+            <h2 className="text-xl mb-4 font-bold">🔑 Login</h2>
+            <input
+              type="password"
+              id="password-input" 
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="Enter password"
+              className="border p-2 rounded w-full mb-3"
+            />
+            <button
+  onClick={handleLogin}
+  className="w-full bg-blue-600 text-white py-2 px-4 rounded hover:bg-blue-700 transition-colors"
+>
+  Login
+</button>
+          </div>
+        </div>
+      ) : (
+        <>
+      <header className="px-6 py-4 border-b bg-white shadow-sm sticky top-0 z-10 flex items-center justify-center">
+        {!imageUrl && (
+          <label className="w-64 h-32 flex flex-col items-center justify-center border-2 border-dashed border-gray-400 rounded-lg cursor-pointer hover:border-blue-500 transition-colors">
+            <span className="text-gray-600">📂 Upload Image</span>
+            <span className="text-xs text-gray-400">(click to select)</span>
+            <input type="file" id="image-upload-header" accept="image/*" onChange={handleImageUpload} className="hidden" />
           </label>
-        </div>
-      </header>
-
-      <main className="p-4">
-        {message && (
-          <div className="mb-3 inline-block px-3 py-2 rounded bg-amber-100 text-amber-900 border border-amber-200">{message}</div>
         )}
-
-        <div className="relative inline-block">
-          <Stage
-            ref={stageRef}
-            width={canvasSize.width}
-            height={canvasSize.height}
-            onMouseDown={onStageMouseDown}
-            onMouseMove={onStageMouseMove}
-            onMouseUp={onStageMouseUp}
-            onDblClick={onDblClick}
-            onWheel={onWheel}
-            onContextMenu={onContextMenu}
-            className="bg-white shadow rounded border"
-          >
-            <Layer>
-              {/* Apply pan & zoom to a Group so IMAGE + ALL ANNOTATIONS move together */}
-              <Group x={pan.x} y={pan.y} scaleX={zoom} scaleY={zoom}>
-                {/* Image in image coordinates */}
-                {imageObj && <KonvaImage image={imageObj} x={0} y={0} />}
-
-                {/* Points (image coords) */}
-                {points.map(([x, y], i) => (
-                  <Circle key={`pt_${i}`} x={x} y={y} radius={5 / zoom} fill="red" />
-                ))}
-
-                {/* Box (image coords) */}
-                {box && (
-                  <Rect
-                    x={box.x1}
-                    y={box.y1}
-                    width={box.x2 - box.x1}
-                    height={box.y2 - box.y1}
-                    stroke="royalblue"
-                    strokeWidth={2 / zoom}
-                  />
-                )}
-
-                {/* Working polygon */}
-                {currentPolygonPoints.length >= 2 && (
-                  <Line
-                    points={currentPolygonPoints.flat()}
-                    stroke="crimson"
-                    strokeWidth={2 / zoom}
-                    closed={false}
-                  />
-                )}
-
-                {/* Final polygons */}
-                {polygons.map((poly) => {
-                  const isSel = poly.id === selectedPolygonId;
-                  const flat = poly.points.flat();
-                  const [cx, cy] = centroid(poly.points);
-                  return (
-                    <React.Fragment key={poly.id}>
-                      <Line
-                        points={flat}
-                        closed
-                        stroke={isSel ? "#ef4444" : "#10b981"}
-                        strokeWidth={isSel ? 3 / zoom : 2 / zoom}
-                        fill={isSel ? "rgba(239,68,68,0.25)" : "rgba(16,185,129,0.2)"}
-                      />
-                      <Text x={cx} y={cy} text={poly.label || "Object"} fontSize={14 / zoom} fill="#111827" />
-                      {mode === "edit" && isSel &&
-                        poly.points.map(([x, y], i) => (
-                          <Circle
-                            key={`h_${poly.id}_${i}`}
-                            x={x}
-                            y={y}
-                            radius={5 / zoom}
-                            fill="#fbbf24"
-                            draggable
-                            onDragStart={() => setDragIdx(i)}
-                            onDragMove={(e) => {
-                              const ix = e.target.x();
-                              const iy = e.target.y();
-                              setPolygons((prev) =>
-                                prev.map((p) => {
-                                  if (p.id !== poly.id) return p;
-                                  const pts = p.points.map((pt, idx) => (idx === i ? [ix, iy] : pt));
-                                  return { ...p, points: pts };
-                                })
-                              );
-                            }}
-                            onDragEnd={() => setDragIdx(null)}
-                          />
-                        ))}
-                    </React.Fragment>
-                  );
-                })}
-              </Group>
-            </Layer>
-          </Stage>
-
-          {/* Context Menu */}
-          {ctxMenu.visible && selectedPolygonId && (
-            <div
-              className="absolute bg-slate-900 text-white text-sm rounded shadow-md"
-              style={{ left: ctxMenu.x, top: ctxMenu.y }}
-            >
-              <button className="block px-3 py-2 hover:bg-slate-800 w-full text-left" onClick={relabelSelected}>
-                Change label
+      </header> 
+        <main
+          className="flex-1 flex flex-col bg-cover bg-center"
+          // style={{ backgroundImage: !imageUrl ? "url('/front_image.png')" : "none" }}
+          style={{ backgroundImage: !imageUrl ? `url(${frontImage})` : "none" }}
+        >
+        {imageUrl && (
+          <>
+            <div className="bg-white shadow-sm p-2 flex justify-center gap-2 flex-wrap">
+              <label className="flex items-center justify-center px-3 py-1 rounded bg-gray-200 hover:bg-gray-300 cursor-pointer text-sm text-gray-700 transition-colors">
+                <span>Upload New Image</span>
+                <input type="file" id="image-upload-toolbar" accept="image/*" onChange={handleImageUpload} className="hidden" />
+              </label>
+              <button
+                className={`flex items-center justify-center px-3 py-1 rounded text-sm transition-colors ${mode === "points" ? "bg-cyan-500 text-white" : "bg-gray-200 text-gray-700 hover:bg-gray-300"}`}
+                onClick={() => setMode(mode === "points" ? null : "points")}
+              >
+                <span className="mr-2">📍</span> Select the Object
               </button>
-              <button className="block px-3 py-2 hover:bg-slate-800 w-full text-left" onClick={deleteSelected}>
-                Delete polygon
+              <button
+                className={`flex items-center justify-center px-3 py-1 rounded text-sm transition-colors ${mode === "edit" ? "bg-cyan-500 text-white" : "bg-gray-200 text-gray-700 hover:bg-gray-300"}`}
+                onClick={() => setMode(mode === "edit" ? null : "edit")}
+              >
+                <span className="mr-2">🖌️</span> Edit
               </button>
+              <button className="flex items-center justify-center px-3 py-1 rounded bg-emerald-600 text-white text-sm hover:bg-emerald-700 transition-colors" onClick={runSAM}>
+                <span className="mr-2">🔍</span> Detect Polygon
+              </button>
+              <button className="flex items-center justify-center px-3 py-1 rounded bg-gray-200 text-gray-700 text-sm hover:bg-gray-300 transition-colors" onClick={undo} disabled={!undoStack.length}>
+                <span className="mr-2">↩️</span> Undo
+              </button>
+              <button className="flex items-center justify-center px-3 py-1 rounded bg-gray-200 text-gray-700 text-sm hover:bg-gray-300 transition-colors" onClick={redo} disabled={!redoStack.length}>
+                <span className="mr-2">↪️</span> Redo
+              </button>
+              <button className="flex items-center justify-center px-3 py-1 rounded bg-gray-200 text-gray-700 text-sm hover:bg-gray-300 transition-colors" onClick={clearAll}>
+                <span className="mr-2">🗑️</span> Clear
+              </button>
+              <button className="flex items-center justify-center px-3 py-1 rounded bg-gray-200 text-gray-700 text-sm hover:bg-gray-300 transition-colors" onClick={exportJSON} disabled={!polygons.length}>
+                <span className="mr-2">💾</span> Save JSON
+              </button>
+              <button className="flex items-center justify-center px-3 py-1 rounded bg-gray-200 text-gray-700 text-sm hover:bg-gray-300 transition-colors" onClick={exportCOCO} disabled={!polygons.length}>
+                <span className="mr-2">💾</span> Save COCO
+              </button>
+              <label className="flex items-center justify-center px-3 py-1 rounded bg-gray-200 hover:bg-gray-300 cursor-pointer text-sm text-gray-700 transition-colors">
+                <span>Load JSON</span>
+                <input type="file" accept=".json" className="hidden" onChange={importJSON} />
+              </label>
             </div>
-          )}
-        </div>
+            <div ref={containerRef} className="flex-1 relative bg-white overflow-hidden stage-container">
+              <Stage
+                ref={stageRef}
+                width={stageSize.width}
+                height={stageSize.height}
+                onMouseDown={onStageMouseDown}
+                onMouseMove={onStageMouseMove}
+                onMouseUp={onStageMouseUp}
+                onWheel={onWheel}
+                onContextMenu={onContextMenu}
+                className="touch-action-manipulation"
+              >
+                <Layer>
+                  <Group x={pan.x} y={pan.y} scaleX={zoom} scaleY={zoom}>
+                    {imageObj && <KonvaImage image={imageObj} x={0} y={0} />}
+                    {/* Points */}
+                    {points.map((pt, i) => (
+                      <Circle key={i} x={pt[0]} y={pt[1]} radius={5 / zoom} fill="red" />
+                    ))}
+                    {/* Polygons */}
+                    {polygons.map((poly) => {
+                      const isSelected = poly.id === selectedPolygonId;
+                      const flatPoints = poly.points.flat();
+                      const [cx, cy] = centroid(poly.points);
+                      return (
+                        <Group key={poly.id}>
+                          <Line
+                            points={flatPoints}
+                            closed
+                            fill="rgba(0,255,0,0.2)"
+                            stroke={isSelected ? "blue" : "green"}
+                            strokeWidth={2 / zoom}
+                          />
+                          {isSelected &&
+                            poly.points.map((pt, idx) => (
+                              <Circle
+                                key={idx}
+                                x={pt[0]}
+                                y={pt[1]}
+                                radius={5 / zoom}
+                                fill="blue"
+                                draggable
+                                onDragStart={() => setDragIdx(idx)}
+                                onDragMove={(e) => {
+                                  const newPoints = [...poly.points];
+                                  newPoints[idx] = [e.target.x(), e.target.y()];
+                                  setPolygons((prev) =>
+                                    prev.map((p) => (p.id === poly.id ? { ...p, points: newPoints } : p))
+                                  );
+                                }}
+                                onDragEnd={saveState}
+                              />
+                            ))}
+                          <Text
+                            x={cx}
+                            y={cy}
+                            text={poly.label || "Obj"}
+                            fontSize={16 / zoom}
+                            fill="black"
+                          />
+                        </Group>
+                      );
+                    })}
+                  </Group>
+                </Layer>
+              </Stage>
+
+              {ctxMenu.visible && selectedPolygonId && (
+                <div
+                  className="absolute bg-gray-900 text-white text-sm rounded shadow-lg"
+                  style={{ left: ctxMenu.x, top: ctxMenu.y }}
+                >
+                  <button className="block px-3 py-2 hover:bg-gray-800 w-full text-left" onClick={relabelSelected}>
+                    Change label
+                  </button>
+                  <button className="block px-3 py-2 hover:bg-gray-800 w-full text-left" onClick={deleteSelected}>
+                    Delete polygon
+                  </button>
+                </div>
+              )}
+            </div>
+          </>
+        )}
       </main>
 
-      <footer className="p-4 text-center text-xs text-slate-500">Backend: {API_BASE}</footer>
+      <footer className="p-4 text-center text-sm text-gray-500 bg-white border-t">
+        
+      </footer>
+      </>
+      )}
     </div>
   );
 }

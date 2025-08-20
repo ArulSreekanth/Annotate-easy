@@ -24,6 +24,25 @@
   animation: pulse-short 1s ease-in-out;
 }
 
-canvas {
-  border: 1px solid red;
+.stage-container {
+  border: 1px solid #e5e7eb; /* Subtle gray border */
+}
+
+@media (max-width: 768px) {
+  .stage-container {
+    width: 100% !important;
+    height: 80vh !important;
+  }
+  .sidebar {
+    transform: translateX(-100%) !important;
+  }
+  .sidebar.open {
+    transform: translateX(0) !important;
+  }
+  .header {
+    padding: 1rem;
+  }
+  main {
+    padding: 1rem;
+  }
 }
