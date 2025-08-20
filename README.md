@@ -1,4 +1,5 @@
 # Image Annotation Tool
+[Visit the Website](https://annotate-easy.netlify.app/)
 
 This repository contains an image annotation tool with both frontend and backend components, designed to allow users to upload images, annotate them with polygons, and export annotations in JSON or COCO formats.
 
@@ -138,3 +139,4 @@ This project is licensed under the [MIT License](LICENSE). This means you are fr
 The full text of the license is available in the [LICENSE](LICENSE) file in this repository. By contributing to this project, you agree that your contributions will also be licensed under the MIT License.
 
 For more details on what the MIT License allows, see [this summary](https://opensource.org/licenses/MIT).
+
