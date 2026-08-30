@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+venv/
+.venv/
+checkpoints/
+backend/*.pt
+node_modules/
+dist/
+.env
+ANNOTATE-EASY-ROADMAP-V2.md
