@@ -70,8 +70,12 @@ made this workable on a small budget.
   large or complex objects.
 - **Edit mode** — drag vertices, relabel, delete, undo/redo.
 - **Folder browsing** — load a directory, step through with Prev/Next. Annotations for
-  each image are held in memory as you move around.
-- **Export** — JSON or COCO.
+  each image are cached as you move around, and auto-saved to the browser's local
+  storage, so a refresh or a closed tab doesn't lose them. Re-select the same folder
+  later and it picks up where you left off instead of re-running the base model.
+- **Export** — JSON or COCO for the open image, or **Save All** for the whole
+  folder as a zip: one JSON per image, filename matching the image (`img1.jpg` →
+  `img1.json`) — the paired-file layout most training pipelines expect.
 
 ---
 
@@ -111,11 +115,30 @@ Set the required environment variables and run:
 
 ```bash
 export ANNOTATE_PASSWORD=$(openssl rand -base64 24)   # required, no default
+echo "Your login password: $ANNOTATE_PASSWORD"        # generated blind -- this is the only place it's shown
 export ANNOTATE_MODEL_TYPE=vit_b
 export ANNOTATE_CHECKPOINT=checkpoints/sam_vit_b_01ec64.pth
 
 python app.py
 ```
+
+Copy that printed password somewhere -- it's not shown again, and you'll need it to log
+in on the frontend below.
+
+> `export` only sets the variable for the current shell -- if you run `python app.py`
+> from a different terminal (or a new one, later) without exporting again, you'll hit
+> `ANNOTATE_PASSWORD is not set. Refusing to start.` For a password that doesn't need
+> re-exporting every session, put it in `backend/.env` instead (see
+> [Configuration](#configuration)):
+> ```bash
+> echo "ANNOTATE_PASSWORD=$(openssl rand -base64 24)" > .env
+> cat .env   # same deal -- this is the only place it's printed, so check it now
+> python app.py
+> ```
+> Either way, changing it later is just editing the value (`.env` or a fresh `export`)
+> and restarting the server -- nothing else references the old one. Forgot it and the
+> server's still running? `grep ANNOTATE_PASSWORD /proc/$(pgrep -f 'python.*app.py')/environ`
+> reads it straight out of the running process.
 
 ### Frontend
 
@@ -125,7 +148,7 @@ npm install
 npm start
 ```
 
-Open the printed URL and log in with the password you set.
+Open the printed URL and log in with the password from the step above.
 
 ---
 
@@ -145,10 +168,15 @@ Open the printed URL and log in with the password you set.
    - Made a mistake: **Undo** / **Redo**.
 4. Use **◀ Prev** / **Next ▶** to move through the folder. Each image remembers what
    you've done to it, so going back and forth doesn't lose work or re-run the base
-   model on an image you've already handled.
-5. Click **Save JSON** or **Save COCO** to export annotations for whichever image is
-   currently open. Do this before moving on if you want to keep the result, since
-   nothing is saved automatically (see [Data handling](#data-handling)).
+   model on an image you've already handled. This survives a refresh too — annotations
+   auto-save to the browser's local storage, matched by filename and size, so
+   re-uploading the same folder later resumes instead of starting over.
+5. Click **Save JSON** or **Save COCO** to export the currently open image, or
+   **Save All** to download a zip with one JSON file per image in the folder — each
+   named after its image (`img1.jpg` → `img1.json`), whether or not that image ended
+   up with any annotations. Auto-save only keeps annotations in this browser on this
+   machine (see [Data handling](#data-handling)) — export if you need the result
+   anywhere else, e.g. to actually train on it.
 
 ---
 
@@ -205,8 +233,13 @@ backend is yours; no third-party service is in the path.
 (Model weight files, the SAM checkpoint and the YOLO `.pt`, are downloaded to disk
 once, same as any other dependency. That's application setup, not your data.)
 
-Annotations live in browser memory and are lost on refresh. That's deliberate:
-nothing here gets persisted anywhere, so export as you go.
+Annotations auto-save to the browser's `localStorage` on this machine, keyed by each
+file's relative path and size — nothing is sent anywhere beyond what a base run or
+point-click already sends to your own backend. Re-selecting the same folder restores
+them; a folder the browser hasn't seen before, or a file that's changed size, starts
+fresh. That's still not the same as export: clearing site data, switching browsers, or
+moving to another machine loses it, so JSON/COCO/Save All is the only way to get
+annotations off this browser.
 
 ---
 
@@ -214,8 +247,10 @@ nothing here gets persisted anywhere, so export as you go.
 
 Things worth knowing before you invest time in this:
 
-- Export covers the currently open image, not the whole folder
-- A page refresh loses unsaved annotations
+- A page refresh only recovers work if you re-select the same folder — the browser
+  can't reopen a local folder on its own, so you always have to pick it again
+- Auto-save lives in this browser's `localStorage` on this machine; clearing site
+  data, switching browsers, or moving to another machine loses it
 - Inference calls block the whole server, not just each other: `predict()` runs
   synchronously inside the request handler, so while one request is running SAM or
   YOLO, nothing else gets served either, not even `/health`. Fine for one annotator,

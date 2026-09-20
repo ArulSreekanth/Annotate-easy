@@ -8,3 +8,5 @@ node_modules/
 dist/
 .env
 ANNOTATE-EASY-ROADMAP-V2.md
+test_image/
+test_scripts/

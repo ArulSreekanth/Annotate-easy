@@ -10,6 +10,7 @@
   "dependencies": {
     "@tailwindcss/postcss": "^4.1.12",
     "axios": "^1.11.0",
+    "jszip": "^3.10.2",
     "konva": "^9.3.22",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",

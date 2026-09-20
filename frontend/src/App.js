@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Stage, Layer, Group, Image as KonvaImage, Circle, Line, Rect, Text } from "react-konva";
 import useImage from "use-image";
 import axios from "axios";
+import JSZip from "jszip";
 
 // --------- CONFIG (no process.env here to avoid "process is not defined") ----------
 const API_BASE = (window && window.__API_BASE__) || "http://localhost:8000";
@@ -32,6 +33,38 @@ function download(filename, blob) {
   URL.revokeObjectURL(url);
 }
 
+// --------- BROWSER-PERSISTED ANNOTATIONS ----------
+// Keyed by relative path + size (not just name) so two images with the same
+// filename in different subfolders don't collide. Persists across page
+// reloads and across re-selecting the same folder in a later session --
+// the in-memory annotationsCacheRef alone only survives within one page load.
+const STORAGE_KEY = "annotateEasy.annotations.v1";
+
+function imageKeyFor(file) {
+  return `${file.webkitRelativePath || file.name}::${file.size}`;
+}
+
+function loadAllSavedAnnotations() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveAnnotationsForKey(key, polygons) {
+  try {
+    const all = loadAllSavedAnnotations();
+    // Store even an empty array: an intentionally-cleared image should stay
+    // "visited" (blank) on revisit, not silently re-trigger base detection.
+    all[key] = { polygons, updatedAt: Date.now() };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(all));
+  } catch (err) {
+    console.warn("Auto-save to browser storage failed", err);
+  }
+}
+
 // --------- APP ----------
 export default function App() {
 
@@ -54,10 +87,17 @@ export default function App() {
   const [isLoadingImage, setIsLoadingImage] = useState(false);
   const [isBaseRunning, setIsBaseRunning] = useState(false);
   const annotationsCacheRef = useRef({});
+  // idx -> [width, height], filled in once per image from session/start's
+  // response so Save All can write correct dimensions for every image, not
+  // just whichever one happens to be open right now.
+  const imageSizeCacheRef = useRef({});
   // Tracks which index is "current" for async callbacks (base run) to check
   // against once they resolve, so a fast Next/Prev click doesn't let a
   // stale base-run response land polygons on the wrong image.
   const latestIndexRef = useRef(-1);
+  // sessionId -> in-flight base-run Promise, so navigating away can wait for
+  // it to settle before telling the backend to tear down that session.
+  const pendingBaseRunsRef = useRef({});
 
   // Modes
   const [mode, setMode] = useState(null); // 'points' | 'edit' | null (removed 'box' and 'draw')
@@ -130,6 +170,32 @@ export default function App() {
     }
   }, [imageObj, stageSize]);
 
+  // Auto-save: mirror the live polygons into the in-memory cache immediately
+  // (so Save All always sees the latest edits without requiring a Prev/Next),
+  // and debounce the browser-storage write so dragging a vertex doesn't hit
+  // localStorage on every mousemove.
+  const saveTimeoutRef = useRef(null);
+  useEffect(() => {
+    if (currentIndex < 0 || !imageFiles[currentIndex]) return;
+    annotationsCacheRef.current[currentIndex] = polygons;
+    const key = imageKeyFor(imageFiles[currentIndex]);
+    if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
+    saveTimeoutRef.current = setTimeout(() => saveAnnotationsForKey(key, polygons), 300);
+    return () => clearTimeout(saveTimeoutRef.current);
+  }, [polygons, currentIndex, imageFiles]);
+
+  // Flush immediately on tab close / refresh so work inside the debounce
+  // window isn't lost.
+  useEffect(() => {
+    const flush = () => {
+      if (currentIndex >= 0 && imageFiles[currentIndex]) {
+        saveAnnotationsForKey(imageKeyFor(imageFiles[currentIndex]), polygons);
+      }
+    };
+    window.addEventListener("beforeunload", flush);
+    return () => window.removeEventListener("beforeunload", flush);
+  }, [polygons, currentIndex, imageFiles]);
+
   // ---------- Session / Upload ----------
   // Loads imageFiles[idx], caching the polygons drawn for whichever image
   // we're leaving so Prev/Next can restore them later. Zoom/pan are left
@@ -144,9 +210,21 @@ export default function App() {
     }
 
     if (sessionId) {
-      axios
-        .post(`${API_BASE}/session/end`, { session_id: sessionId }, { headers: authHeaders() })
-        .catch(() => {});
+      // If this session's base run is still in flight, ending the session
+      // now would 404 that request mid-flight on the backend and silently
+      // drop its detections (annotationsCacheRef.current[idx] would never
+      // get populated). Defer the end call until it settles instead of
+      // racing it -- navigation itself isn't delayed, only this cleanup call.
+      const outgoingSessionId = sessionId;
+      const pending = pendingBaseRunsRef.current[outgoingSessionId];
+      const endSession = () => {
+        delete pendingBaseRunsRef.current[outgoingSessionId];
+        axios
+          .post(`${API_BASE}/session/end`, { session_id: outgoingSessionId }, { headers: authHeaders() })
+          .catch(() => {});
+      };
+      if (pending) pending.finally(endSession);
+      else endSession();
     }
 
     const file = files[idx];
@@ -173,12 +251,13 @@ export default function App() {
     try {
       const { data } = await axios.post(`${API_BASE}/session/start`, formData, { headers: authHeaders() });
       setSessionId(data.session_id);
+      imageSizeCacheRef.current[idx] = data.image_size;
       setMessage(`Image ${idx + 1}/${files.length} (${data.image_size[0]}x${data.image_size[1]})`);
       // Only auto-run the base model the first time this image is opened --
       // once it's been visited, whatever's cached (base-run output plus any
       // edits) is the source of truth and shouldn't be silently overwritten.
       if (isFirstVisit) {
-        runBaseRun(data.session_id, idx);
+        pendingBaseRunsRef.current[data.session_id] = runBaseRun(data.session_id, idx, file);
       }
     } catch (err) {
       setMessage(`Error starting session: ${err?.response?.data?.detail || err.message}`);
@@ -187,18 +266,25 @@ export default function App() {
     }
   };
 
-  const runBaseRun = async (sid, idx) => {
+  const runBaseRun = async (sid, idx, file) => {
     setIsBaseRunning(true);
     setMessage("Running base model...");
     try {
       const { data } = await axios.post(`${API_BASE}/base_run`, { session_id: sid }, { headers: authHeaders() });
-      if (latestIndexRef.current !== idx) return; // navigated away before this resolved
       const newPolys = data.detections.map((d, i) => ({
         id: `base_${idx}_${i}_${Date.now()}`,
         points: d.polygon,
         label: d.label,
         score: d.score,
       }));
+      // Cache (and auto-save) the result unconditionally, even if the user
+      // has already navigated to a different image before this resolved --
+      // otherwise a fast Next/Prev during an in-flight run permanently
+      // strands this image as "visited but empty" instead of holding the
+      // proposals it actually computed, and it would never get retried.
+      annotationsCacheRef.current[idx] = newPolys;
+      if (file) saveAnnotationsForKey(imageKeyFor(file), newPolys);
+      if (latestIndexRef.current !== idx) return; // navigated away -- don't touch the live canvas
       // Not using saveState() here: it reads points/polygons/zoom/pan from
       // this closure, which still holds whatever was on screen when the
       // navigation that triggered this run started (the previous image's
@@ -208,7 +294,6 @@ export default function App() {
       setUndoStack((st) => [...st, { points: [], polygons: [], selectedPolygonId: null, zoom, pan }]);
       setRedoStack([]);
       setPolygons(newPolys);
-      annotationsCacheRef.current[idx] = newPolys;
       setMessage(`Base run found ${newPolys.length} object(s) -- review and adjust as needed`);
     } catch (err) {
       if (latestIndexRef.current !== idx) return;
@@ -225,9 +310,26 @@ export default function App() {
       return;
     }
     files.sort((a, b) => (a.webkitRelativePath || a.name).localeCompare(b.webkitRelativePath || b.name));
-    annotationsCacheRef.current = {};
+
+    // Restore any annotations auto-saved for these exact files (matched by
+    // relative path + size) in a previous session, so re-opening the same
+    // folder resumes instead of re-running base detection from scratch.
+    const saved = loadAllSavedAnnotations();
+    const restoredCache = {};
+    let restoredCount = 0;
+    files.forEach((file, idx) => {
+      const entry = saved[imageKeyFor(file)];
+      if (entry) {
+        restoredCache[idx] = entry.polygons;
+        restoredCount += 1;
+      }
+    });
+    annotationsCacheRef.current = restoredCache;
     setImageFiles(files);
     loadImageAtIndex(0, files, { cacheCurrent: false });
+    if (restoredCount) {
+      setMessage(`Restored saved annotations for ${restoredCount}/${files.length} image(s)`);
+    }
   };
 
   const goToImage = (idx) => {
@@ -468,6 +570,51 @@ export default function App() {
     };
     download(`${imageFile.name}_coco.json`, new Blob([JSON.stringify(coco, null, 2)], { type: "application/json" }));
   };
+  const exportAll = async () => {
+    if (!imageFiles.length) return;
+    // annotationsCacheRef lags the currently-open image until the debounced
+    // effect fires; use the live `polygons` for currentIndex so Save All
+    // always reflects what's on screen right now.
+    const merged = { ...annotationsCacheRef.current };
+    if (currentIndex >= 0) merged[currentIndex] = polygons;
+
+    // One JSON per image, filename matching the image's own basename (just
+    // the extension swapped) -- the convention training pipelines expect
+    // (paired image/label files), not one combined blob for the whole folder.
+    const zip = new JSZip();
+    const usedNames = new Set();
+    let annotatedCount = 0;
+
+    imageFiles.forEach((file, idx) => {
+      const polys = merged[idx] || [];
+      if (polys.length) annotatedCount += 1;
+      const [width, height] = imageSizeCacheRef.current[idx] || [0, 0];
+
+      const baseName = file.name.replace(/\.[^./]+$/, "") || `image_${idx}`;
+      let entryName = `${baseName}.json`;
+      let suffix = 1;
+      while (usedNames.has(entryName)) entryName = `${baseName}_${suffix++}.json`; // two images sharing a basename
+      usedNames.add(entryName);
+
+      zip.file(entryName, JSON.stringify({
+        image: file.webkitRelativePath || file.name,
+        width,
+        height,
+        polygons: polys.map((p) => p.points),
+        labels: polys.map((p) => p.label || "Object"),
+        scores: polys.map((p) => p.score ?? null),
+      }, null, 2));
+    });
+
+    try {
+      const blob = await zip.generateAsync({ type: "blob" });
+      download(`annotations_all_${imageFiles.length}_images.zip`, blob);
+      setMessage(`Saved all: ${annotatedCount}/${imageFiles.length} image(s) had annotations (one JSON per image inside the zip)`);
+    } catch (err) {
+      setMessage(`Save All failed: ${err.message}`);
+    }
+  };
+
   const importJSON = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -620,6 +767,9 @@ export default function App() {
               </button>
               <button className="flex items-center justify-center px-3 py-1 rounded bg-gray-200 text-gray-700 text-sm hover:bg-gray-300 transition-colors" onClick={exportCOCO} disabled={!polygons.length}>
                 <span className="mr-2">💾</span> Save COCO
+              </button>
+              <button className="flex items-center justify-center px-3 py-1 rounded bg-blue-600 text-white text-sm hover:bg-blue-700 transition-colors" onClick={exportAll} disabled={!imageFiles.length}>
+                <span className="mr-2">💾</span> Save All
               </button>
               <label className="flex items-center justify-center px-3 py-1 rounded bg-gray-200 hover:bg-gray-300 cursor-pointer text-sm text-gray-700 transition-colors">
                 <span>Load JSON</span>
